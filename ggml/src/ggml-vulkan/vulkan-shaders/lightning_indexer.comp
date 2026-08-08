@@ -1,0 +1,162 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+// One workgroup computes the indexer scores of KV_TILE K vectors for a single
+// (token, stream) pair. The K tile and one NH_CHUNK-head slice of Q are staged
+// in shared memory, each invocation computes one full (kv row, head) dot
+// product, so no cross-invocation reduction is needed and the shader has no
+// dependency on the subgroup size.
+#define BLOCK_SIZE 128
+#define KV_TILE 16
+#define NH_CHUNK 8
+// indexer K head size, the only value the graph produces (asserted in supports_op)
+#define HSK 128
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint n_head;
+    uint n_kv;
+    uint nem3;                        // ne[3] of the mask, streams index it mod nem3
+    uint nbq1; uint nbq2; uint nbq3;  // Q strides, in elements
+    uint nbk2; uint nbk3;             // K strides, in blocks
+    uint nbw1; uint nbw3;             // W strides, in elements
+    uint nbm1; uint nbm3;             // M strides, in elements
+    uint nbd1; uint nbd3;             // dst strides, in elements
+    uint q_offset;                    // misalignment offsets, same units as the strides
+    uint k_offset;
+    uint w_offset;
+    uint m_offset;
+    uint d_offset;
+} p;
+
+layout (binding = 0) readonly buffer K {A_TYPE data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 0) readonly buffer K_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 0) readonly buffer K_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout (binding = 1) readonly buffer Q {float data_q[];};
+layout (binding = 2) readonly buffer W {float data_w[];};
+layout (binding = 3) readonly buffer M {float16_t data_m[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+#include "dequant_funcs.glsl"
+
+// vec4 tiles so the dot phase issues one load per 4 MACs;
+// +1 padding to keep the strided accesses of the dot phase conflict-free
+shared vec4 sh_k[KV_TILE][HSK/4 + 1];
+shared vec4 sh_q[NH_CHUNK][HSK/4 + 1];
+shared float sh_w[NH_CHUNK];
+shared float sh_qk[KV_TILE][NH_CHUNK];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kv0 = gl_WorkGroupID.x * KV_TILE;
+    const uint t   = gl_WorkGroupID.y; // token
+    const uint s   = gl_WorkGroupID.z; // stream
+
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+    // stage KV_TILE K vectors in shared memory, dequantized to f32
+#if QUANT_R == 1
+    // dequantize4 yields the elements at iqs + {0,1,2,3}*y_offset, and here
+    // y_offset is 1, so a whole aligned vec4 of the tile comes from one call
+    // and is written with a single store.
+    [[unroll]] for (uint idx = tid; idx < KV_TILE*HSK/4; idx += BLOCK_SIZE) {
+        const uint r    = idx / (HSK/4);
+        const uint i00  = (idx % (HSK/4)) * 4;
+        const uint i_kv = kv0 + r;
+
+        vec4 v = vec4(0.0f);
+        if (i_kv < p.n_kv) {
+            const uint ib = p.k_offset + i_kv*p.nbk2 + s*p.nbk3 + i00/QUANT_K;
+            v = dequantize4(ib, i00 % QUANT_K, 0);
+#if QUANT_K > 1
+            const vec2 dm = get_dm(ib, 0);
+            v = v*dm.x + dm.y;
+#endif
+        }
+        sh_k[r][i00/4] = v;
+    }
+#else
+    // y_offset is QUANT_K/2 here, so a dequantized pair straddles the tile row
+    // and the two halves have to be placed separately.
+    const uint y_offset = QUANT_K/2;
+    [[unroll]] for (uint idx = tid; idx < KV_TILE*HSK/2; idx += BLOCK_SIZE) {
+        const uint r    = idx / (HSK/2);
+        const uint i00  = (idx % (HSK/2)) * 2;
+        const uint i_kv = kv0 + r;
+
+        const uint iybs = i00 - i00%QUANT_K;
+        const uint iqs  = (i00 % QUANT_K)/QUANT_R;
+
+        vec2 v = vec2(0.0f);
+        if (i_kv < p.n_kv) {
+            const uint ib = p.k_offset + i_kv*p.nbk2 + s*p.nbk3 + i00/QUANT_K;
+            v = dequantize(ib, iqs, 0);
+            const vec2 dm = get_dm(ib, 0);
+            v = v*dm.x + dm.y;
+        }
+        const uint e0 = iybs + iqs;
+        const uint e1 = iybs + iqs + y_offset;
+        sh_k[r][e0/4][e0%4] = v.x;
+        sh_k[r][e1/4][e1%4] = v.y;
+    }
+#endif
+
+    barrier();
+
+    // per-invocation score accumulator; only invocations with tid < KV_TILE
+    // accumulate, one K vector each
+    float score = 0.0f;
+
+    for (uint h0 = 0; h0 < p.n_head; h0 += NH_CHUNK) {
+        // stage an NH_CHUNK slice of Q heads and their weights
+        [[unroll]] for (uint idx = tid; idx < NH_CHUNK*HSK; idx += BLOCK_SIZE) {
+            const uint hh = idx / HSK;
+            const uint e  = idx % HSK;
+            sh_q[hh][e/4][e%4] = data_q[p.q_offset + (h0 + hh)*p.nbq1 + t*p.nbq2 + s*p.nbq3 + e];
+        }
+        if (tid < NH_CHUNK) {
+            sh_w[tid] = data_w[p.w_offset + t*p.nbw1 + s*p.nbw3 + h0 + tid];
+        }
+        barrier();
+
+        // one full dot product per invocation: BLOCK_SIZE = KV_TILE * NH_CHUNK
+        const uint r  = tid % KV_TILE;
+        const uint hh = tid / KV_TILE;
+        vec4 acc4 = vec4(0.0f);
+        [[unroll]] for (uint e = 0; e < HSK/4; ++e) {
+            acc4 = fma(sh_q[hh][e], sh_k[r][e], acc4);
+        }
+        const float acc = dot(acc4, vec4(1.0f));
+        sh_qk[r][hh] = max(acc, 0.0f) * sh_w[hh];
+        barrier();
+
+        // fold this head slice into the per-K-vector scores. The next
+        // iteration's stores to sh_q/sh_qk all happen after its staging
+        // barrier, so no extra barrier is needed here.
+        if (tid < KV_TILE) {
+            [[unroll]] for (uint hh2 = 0; hh2 < NH_CHUNK; ++hh2) {
+                score += sh_qk[tid][hh2];
+            }
+        }
+    }
+
+    if (tid < KV_TILE) {
+        const uint i_kv = kv0 + tid;
+        if (i_kv < p.n_kv) {
+            const float m = float(data_m[p.m_offset + t*p.nbm1 + (s % p.nem3)*p.nbm3 + i_kv]);
+            data_d[p.d_offset + t*p.nbd1 + s*p.nbd3 + i_kv] = score + m;
+        }
+    }
+}

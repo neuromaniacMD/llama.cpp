@@ -1039,6 +1039,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_sum_rows_f32;
+    vk_pipeline pipeline_lightning_indexer[GGML_TYPE_COUNT];
     vk_pipeline pipeline_fwht_f32[4];
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
@@ -1399,6 +1400,22 @@ struct vk_op_fwht_push_constants {
     uint32_t src_offset;
     uint32_t dst_offset;
     float scale;
+};
+
+struct vk_op_lightning_indexer_push_constants {
+    uint32_t n_head;
+    uint32_t n_kv;
+    uint32_t nem3;
+    uint32_t nbq1; uint32_t nbq2; uint32_t nbq3; // Q strides, in elements
+    uint32_t nbk2; uint32_t nbk3;                // K strides, in blocks
+    uint32_t nbw1; uint32_t nbw3;                // W strides, in elements
+    uint32_t nbm1; uint32_t nbm3;                // M strides, in elements
+    uint32_t nbd1; uint32_t nbd3;                // dst strides, in elements
+    uint32_t q_offset;
+    uint32_t k_offset;
+    uint32_t w_offset;
+    uint32_t m_offset;
+    uint32_t d_offset;
 };
 
 struct vk_op_count_experts_push_constants {
@@ -5725,6 +5742,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+
+    // wg_denoms[0] must match KV_TILE in lightning_indexer.comp
+#define CREATE_LI(TYPE, NAME) \
+    ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer[TYPE], #NAME, NAME ## _len, NAME ## _data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {16, 1, 1}, {}, 1, true);
+    CREATE_LI(GGML_TYPE_F32,    lightning_indexer_f32)
+    CREATE_LI(GGML_TYPE_F16,    lightning_indexer_f16)
+    CREATE_LI(GGML_TYPE_BF16,   lightning_indexer_bf16)
+    CREATE_LI(GGML_TYPE_Q4_0,   lightning_indexer_q4_0)
+    CREATE_LI(GGML_TYPE_Q4_1,   lightning_indexer_q4_1)
+    CREATE_LI(GGML_TYPE_Q5_0,   lightning_indexer_q5_0)
+    CREATE_LI(GGML_TYPE_Q5_1,   lightning_indexer_q5_1)
+    CREATE_LI(GGML_TYPE_Q8_0,   lightning_indexer_q8_0)
+    CREATE_LI(GGML_TYPE_IQ4_NL, lightning_indexer_iq4_nl)
+#undef CREATE_LI
     // Intel Windows driver older than 32.0.101.8860 will crash when using fwht kernels on Xe2+ GPUS so we gate that here
     const bool can_use_fwht = device->driver_id != vk::DriverId::eIntelProprietaryWindows ||
         device->architecture != vk_device_architecture::INTEL_XE2 ||
@@ -9952,6 +9983,47 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+}
+
+static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * w, const ggml_tensor * m, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_vk_lightning_indexer(" << q << ", " << k << ", " << w << ", " << m << ", " << dst << ")");
+
+    vk_pipeline pipeline = ctx->device->pipeline_lightning_indexer[k->type];
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t n_head   = (uint32_t)q->ne[1];
+    const uint32_t n_tokens = (uint32_t)q->ne[2];
+    const uint32_t n_stream = (uint32_t)q->ne[3];
+    const uint32_t n_kv     = (uint32_t)k->ne[2];
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q,   true);
+    const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k,   true);
+    const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w,   true);
+    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, m,   true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    // the shader addresses Q/W/M/dst in elements and K in blocks; supports_op
+    // checks that every stride divides evenly by the respective type size
+    const size_t ts_k = ggml_type_size(k->type);
+    vk_op_lightning_indexer_push_constants pc = {
+        n_head,
+        n_kv,
+        (uint32_t)m->ne[3],
+        (uint32_t)(q->nb[1] / sizeof(float)), (uint32_t)(q->nb[2] / sizeof(float)), (uint32_t)(q->nb[3] / sizeof(float)),
+        (uint32_t)(k->nb[2] / ts_k),          (uint32_t)(k->nb[3] / ts_k),
+        (uint32_t)(w->nb[1] / sizeof(float)), (uint32_t)(w->nb[3] / sizeof(float)),
+        (uint32_t)(m->nb[1] / sizeof(ggml_fp16_t)), (uint32_t)(m->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t)(dst->nb[1] / sizeof(float)), (uint32_t)(dst->nb[3] / sizeof(float)),
+        get_misalign_bytes(ctx, q)   / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, k)   / (uint32_t)ts_k,
+        get_misalign_bytes(ctx, w)   / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, m)   / (uint32_t)sizeof(ggml_fp16_t),
+        get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { k_buf, q_buf, w_buf, m_buf, d_buf }, pc, { n_kv, n_tokens, n_stream });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -15533,6 +15605,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_cumsum(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_LIGHTNING_INDEXER:
+        ggml_vk_lightning_indexer(ctx, compute_ctx, src0, src1, src2, src3, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -18340,6 +18416,53 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return false;
             }
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * k = op->src[1];
+                const ggml_tensor * w = op->src[2];
+                const ggml_tensor * m = op->src[3];
+
+                // the shader hardcodes the indexer head size and processes
+                // heads in slices of 8
+                if (q->ne[0] != 128 || (q->ne[1] != 64 && q->ne[1] != 32)) {
+                    return false;
+                }
+
+                switch (k->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_BF16:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_IQ4_NL:
+                        break;
+                    default:
+                        return false;
+                }
+
+                // rows must be contiguous, and the shader addresses tensors in
+                // whole elements (K in blocks)
+                for (const ggml_tensor * t : {q, k, w, m, op}) {
+                    const size_t ts = ggml_type_size(t->type);
+                    if (t->nb[0] != ts) {
+                        return false;
+                    }
+                    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                        if (t->nb[i] % ts != 0) {
+                            return false;
+                        }
+                    }
+                }
+
+                // one workgroup row per 16 K vectors / token / stream
+                return CEIL_DIV((uint32_t)k->ne[2], 16u) <= device->properties.limits.maxComputeWorkGroupCount[0] &&
+                       (uint32_t)q->ne[2] <= device->properties.limits.maxComputeWorkGroupCount[1] &&
+                       (uint32_t)q->ne[3] <= device->properties.limits.maxComputeWorkGroupCount[2];
+            }
         case GGML_OP_SOLVE_TRI:
             {
                 if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {
@@ -19270,6 +19393,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_sum_rows(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_CUMSUM) {
             tensor_clone = ggml_cumsum(ggml_ctx, src_clone[0]);
+        } else if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
+            tensor_clone = ggml_lightning_indexer(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_MEAN) {
             tensor_clone = ggml_mean(ggml_ctx, src_clone[0]);
         } else if (tensor->op == GGML_OP_ARGMAX) {
